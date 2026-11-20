@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP="$HOME/Applications/ShotPin.app"
+APP="$HOME/Applications/BetterShot.app"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST="$LAUNCH_AGENTS_DIR/com.shotpin.agent.plist"
 LABEL="com.shotpin.agent"

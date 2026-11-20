@@ -1,116 +1,37 @@
-# ShotPin
+# BetterShot
 
-macOS shows a screenshot thumbnail in the bottom-right corner for about five seconds and
-then it's gone. ShotPin replaces that thumbnail with one that stays put until you delete
-it, and keeps the pending screenshot out of your normal save location.
+**截完，就留在手边。** BetterShot 是一款 macOS 截图工具。继续用熟悉的系统截图快捷键，截完的图会浮在屏幕边上，需要时可以直接拖进聊天框、文档或访达。
 
-Your capture keys don't change. ⌘⇧3, ⌘⇧4 and ⌘⇧5 keep the native macOS capture and
-selection UI. While ShotPin is running, macOS writes captures into ShotPin's private
-per-run workspace instead of the Desktop, and ShotPin restores your previous screenshot
-location when it quits.
+![BetterShot 的五个截图场景](docs/bettershot-overview.jpg)
 
-```
-┌───────────────────────┐
-│                       │   click  → open in the default app
-│      screenshot       │   drag   → drop repeatedly into apps or Finder
-│                       │   hover  → ✕ to delete
-└───────────────────────┘   right-click → open, copy, reveal, delete, dismiss all
-        bottom-right, no timer
-```
+## 常用操作
 
-ShotPin's thumbnails are excluded from screen capture, so pinned screenshots don't
-appear inside later screenshots.
+| 你想做什么 | 怎么操作 |
+| --- | --- |
+| 截图 | 按 `⌘⇧4` 截选区，按 `⌘⇧3` 截全屏。允许辅助功能访问后，也可以右键点 BetterShot 菜单栏图标启动选区截图。 |
+| 预览、标注和分享 | 长按截图快速预览，双击打开标注。可以直接拖到支持图片的聊天框或应用，也可以从右键菜单隔空投送。 |
+| 收起或展开 | 单击截图把它们收成一叠，再单击堆栈展开。堆栈可以拖到屏幕四角，长按后还能拖出最新一张。 |
+| 看细节 | 右键复制图中文字，或选择「与另一张对照」并排查看。两张图可以同步缩放。 |
+| 保存或恢复 | 用右键菜单的「关闭此图窗」保存截图，或者向截图所在的屏幕边缘滑动保存。关闭后可从菜单栏恢复最近一次关闭的图窗。 |
+| 调整工作方式 | 左键点菜单栏图标，可以设置排列位置、自动拷贝、悬停自动展开、双击 Command 展开或收起，以及隐藏或显示全部截图。 |
 
-## Why not just use the built-in preference
+## 从源码构建
 
-macOS has an undocumented key that extends the native thumbnail's lifetime:
+需要 macOS 13 或更新版本，以及 Xcode 命令行工具。还没安装工具的话，先运行 `xcode-select --install`。
 
-```bash
-defaults write com.apple.screencaptureui thumbnailExpiration -float 600
-killall screencaptureui
+```sh
+git clone https://github.com/mingzhijun1120-coder/BetterShot.git
+cd BetterShot
+./build.sh
+open "$HOME/Applications/BetterShot.app"
 ```
 
-That works (verified on macOS 26.6), and if a longer-but-still-temporary thumbnail is all
-you want, use it instead of this — no third-party code in your login items.
+初次启动时，按系统提示决定是否授予辅助功能访问。菜单栏右键截图、全局按键手势等需要该权限。若系统自己显示的截图浮动缩略图与 BetterShot 重叠，可以在 `⌘⇧5` →「选项」里关闭「显示浮动缩略图」。
 
-ShotPin preserves that temporary behavior for as long as you want. The screenshot is
-backed by a file in a private per-run workspace so drag and drop works reliably across
-apps, but it never appears in the Desktop or your configured screenshot folder. Clicking
-the pin's ✕ deletes it immediately. Quitting ShotPin deletes closed pending captures;
-if a file is still settling, the next launch retires it safely.
+## 截图存在哪里
 
-Compared to the full CleanShot X alternatives ([Capso](https://github.com/lzhgus/Capso),
-[BetterShot](https://github.com/KartikLabhshetwar/better-shot),
-[ScreenCap](https://github.com/8tp/ScreenCap), and others), which also pin but replace
-the whole capture pipeline with their own hotkeys, editor and file handling, ShotPin does
-one thing and leaves the native flow alone.
+BetterShot 运行时会把系统截图的保存位置临时切到本机工作目录，正常退出时恢复原设置。关闭时选择的保存文件夹可在菜单栏修改。仍留在屏幕边上的截图会在下次启动时恢复。截图和文字识别在本机处理；拖放、拷贝或隔空投送由你发起。
 
-## Interactions
+## 开源许可证
 
-- **Click** the pin: opens the temporary file in its default app and keeps the pin.
-- **Drag** the pin: drops the image into Slack, Messages, a browser, or another app and
-  keeps the pin, so the same capture can be dragged more than once. Dropping into Finder
-  creates a normal permanent copy there.
-- **Hover** the pin: an ✕ appears in the top-left corner; click it to permanently delete
-  the temporary screenshot and remove the pin.
-- **Right-click**: Open, Copy Image, Reveal in Finder, Delete Screenshot, Dismiss,
-  Dismiss All, Quit ShotPin.
-
-Nothing dismisses itself on a timer. Several screenshots in a row stack upward from the
-corner, oldest at the bottom, and pile up in place once the column runs out of room. Pins
-float above other windows and follow you across Spaces and full-screen apps, but don't
-appear in screenshots.
-
-## Private capture storage
-
-At launch, ShotPin remembers `com.apple.screencapture location`, redirects screenshots to
-a private per-run directory, and watches that directory for new captures. A normal quit
-restores the previous location and deletes pending captures; the next launch retires the
-workspace after a short grace period for any in-flight capture writer. If ShotPin was
-interrupted, its next launch restores the saved setting, starts a new isolated session,
-and queues the stale workspace for safe cleanup. Screen recordings aren't pinned. ShotPin
-preserves them in the original screenshot location, while a recording that is still
-changing or needs a cross-volume copy stays recoverable until a later launch can move it
-safely.
-
-## Install
-
-Requires macOS 13 or later and the Xcode command line tools (`xcode-select --install`)
-for `swiftc`.
-
-```bash
-git clone https://github.com/DeweyMarco/shotpin.git
-cd shotpin
-./install.sh
-```
-
-That compiles `ShotPin.app` into `~/Applications`, turns off the native thumbnail
-(`com.apple.screencapture show-thumbnail`, since it would fight for the same corner and
-delay the file write), and loads a LaunchAgent so ShotPin runs at login. Choosing Quit
-stops ShotPin for the rest of the login session; it starts again at the next login or
-when you run the `kickstart` command below.
-
-macOS posts a one-time notice that ShotPin can run in the background. The binary is ad-hoc
-signed, not notarized, because it never leaves your machine.
-
-## Manage
-
-```bash
-launchctl kickstart -k gui/$UID/com.shotpin.agent   # restart, also clears all pins
-launchctl bootout gui/$UID/com.shotpin.agent        # stop until next login
-rm ~/Library/LaunchAgents/com.shotpin.agent.plist   # after bootout, prevent future logins
-defaults write com.apple.screencapture show-thumbnail -bool true   # restore native thumbnail
-```
-
-Logs are at `~/Library/Logs/ShotPin/shotpin.out.log` and
-`~/Library/Logs/ShotPin/shotpin.err.log`. After editing
-`Sources/main.swift`, run `./build.sh` and then the `kickstart` line.
-
-## Tuning
-
-The constants at the top of `Sources/main.swift`: `maxDimension` (220pt thumbnail),
-`screenMargin` (18pt from the screen edges), `stackSpacing`, `corner` radius.
-
-## License
-
-MIT
+BetterShot 由 **Justin Zhou** 在 [Marco Dewey 的 ShotPin](https://github.com/DeweyMarco/shotpin) 基础上开发。项目沿用 [MIT 许可证](LICENSE)。

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Compiles ShotPin and atomically installs it into ~/Applications/ShotPin.app.
+# Compiles BetterShot and atomically installs it into ~/Applications/BetterShot.app.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP_DIR="$HOME/Applications"
-APP="$APP_DIR/ShotPin.app"
+APP_DIR="${SHOTPIN_APP_DIR:-$HOME/Applications}"
+APP="$APP_DIR/BetterShot.app"
 ARCH="${SHOTPIN_ARCH:-$(uname -m)}"
 BUILD_DIR=""
 LOCK_FILE="$APP_DIR/.ShotPin.install.lock"
@@ -76,9 +76,13 @@ cat > "$STAGED_APP/Contents/Info.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>ShotPin</string>
-  <key>CFBundleDisplayName</key><string>ShotPin</string>
+  <key>CFBundleName</key><string>BetterShot</string>
+  <key>CFBundleDisplayName</key><string>BetterShot</string>
+  <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+  <key>CFBundleLocalizations</key><array><string>zh-Hans</string><string>en</string></array>
+  <key>CFBundleGetInfoString</key><string>BetterShot · 作者 Justin Zhou</string>
   <key>CFBundleExecutable</key><string>ShotPin</string>
+  <key>CFBundleIconFile</key><string>BetterShot.icns</string>
   <key>CFBundleIdentifier</key><string>com.shotpin.ShotPin</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
@@ -90,12 +94,19 @@ cat > "$STAGED_APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+cp "$ROOT/Resources/BetterShot.icns" "$STAGED_APP/Contents/Resources/BetterShot.icns"
 plutil -lint "$STAGED_APP/Contents/Info.plist"
+SOURCES=("$ROOT"/Sources/*.swift)
 swiftc -O -target "${ARCH}-apple-macosx13.0" \
-  -framework AppKit -framework CoreServices \
-  -o "$BIN" "$ROOT/Sources/main.swift"
+  -framework AppKit -framework CoreServices -framework QuickLookUI \
+  -o "$BIN" "${SOURCES[@]}"
 
-codesign --force --sign - "$STAGED_APP"
+# A stable signing identity keeps macOS privacy permissions valid across builds.
+SIGNING_IDENTITY="${SHOTPIN_SIGNING_IDENTITY:-}"
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+  SIGNING_IDENTITY="$(security find-identity -v -p codesigning | awk '/"Apple Development:/ {print $2; exit}')"
+fi
+codesign --force --sign "${SIGNING_IDENTITY:--}" "$STAGED_APP"
 codesign --verify --deep --strict "$STAGED_APP"
 
 # Both paths live in APP_DIR, so each rename is atomic. Keep the previous bundle
