@@ -1152,6 +1152,7 @@ final class ShotView: NSView, NSDraggingSource {
     }
 
     var stackImage: NSImage? { imageView.image }
+    var transitionCardFrame: NSRect { card.frame }
 
     func containsScreenshotPoint(_ pointInWindow: NSPoint) -> Bool {
         let pointInView = convert(pointInWindow, from: nil)
@@ -1439,6 +1440,7 @@ final class ShotView: NSView, NSDraggingSource {
             menu.addItem(placementItem)
             menu.addItem(.separator())
             for (title, selector, enabled) in [("自动拷贝", #selector(toggleAutoCopy), UserDefaults.standard.bool(forKey: "autoCopyNewShot")),
+                                                ("全屏自动隐藏", #selector(toggleFullscreenAutoHide), AppDelegate.fullscreenAutoHideEnabled),
                                                 ("悬停自动展开", #selector(toggleAutoExpand), PinManager.autoExpandEnabled),
                                                 ("双击 Command 展开或收起", #selector(toggleCommandExpand), UserDefaults.standard.bool(forKey: "commandExpandStack"))] {
                 let item = menu.addItem(withTitle: title, action: selector, keyEquivalent: enabled ? "✓" : "")
@@ -1691,10 +1693,10 @@ final class ShotView: NSView, NSDraggingSource {
 
     @objc private func trashFile() {
         do {
-            try shotFileManager.removeItem(at: url)
-            if let panel { PinManager.shared.remove(panel, remember: false) }
+            try shotFileManager.trashItem(at: url, resultingItemURL: nil)
+            if let panel { PinManager.shared.remove(panel, trashing: true, remember: false) }
         } catch {
-            showError("无法删除截图")
+            showError("无法移到废纸篓")
         }
     }
 
@@ -1724,6 +1726,10 @@ final class ShotView: NSView, NSDraggingSource {
     }
 
     @objc private func dismissAll() { PinManager.shared.dismissAll() }
+
+    @objc private func toggleFullscreenAutoHide() {
+        (NSApp.delegate as? AppDelegate)?.toggleFullscreenAutoHide()
+    }
 
     @objc private func quitApp() { NSApp.terminate(nil) }
 }
@@ -1779,87 +1785,207 @@ final class PinManager {
     static var autoExpandEnabled: Bool { UserDefaults.standard.bool(forKey: "hoverExpandStack") }
     private var panels: [PinPanel] = []
     private(set) var screenshotsHidden = false
+    private(set) var manuallyHidden = false
+    private var fullscreenHidden = false
     private(set) var hidingAnimation = false
+    private var visibilityOverlay: NSPanel?
+    private var visibilityLayers: [ObjectIdentifier: CALayer] = [:]
+    private var departureCount = 0
+    private var departureLayout: [PinPanel]?
 
     func toggleHidden(iconFrame: NSRect?) {
         guard !hidingAnimation else { return }
-        let showing = screenshotsHidden
-        screenshotsHidden = !showing
+        manuallyHidden.toggle()
+        updateVisibility(iconFrame: iconFrame)
+    }
+
+    func setFullscreenHidden(_ hidden: Bool, iconFrame: NSRect?) {
+        fullscreenHidden = hidden
+        if hidden { ScreenshotTransitions.hideOverlays() }
+        updateVisibility(iconFrame: iconFrame, fullscreenTransition: true)
+    }
+
+    private func orderScreenshots(_ visible: Bool) {
+        if !visible {
+            stackPanel?.orderOut(nil)
+            panels.forEach { $0.orderOut(nil) }
+        } else if let stack = stackPanel {
+            stack.ignoresMouseEvents = false
+            stack.orderFrontRegardless()
+        } else {
+            layout()
+            for panel in panels {
+                panel.alphaValue = 1
+                panel.orderFrontRegardless()
+            }
+        }
+    }
+
+    private func updateVisibility(iconFrame: NSRect?, fullscreenTransition: Bool = false) {
+        let hidden = manuallyHidden || fullscreenHidden
+        let hideImmediately = fullscreenTransition && hidden
+        guard hidden != screenshotsHidden || (hideImmediately && visibilityOverlay != nil) else { return }
+        let showing = !hidden
+        screenshotsHidden = hidden
         automaticallyExpanded = false
         hoverStarted = nil
         awayStarted = nil
         stackHint.hide()
+        let interrupted = visibilityOverlay != nil
+        var startingFrames: [ObjectIdentifier: (frame: CGRect, opacity: Float)] = [:]
+        if let previous = visibilityOverlay {
+            for (id, layer) in visibilityLayers where !hideImmediately {
+                let current = layer.presentation() ?? layer
+                startingFrames[id] = (current.frame.offsetBy(dx: previous.frame.minX, dy: previous.frame.minY),
+                                      current.opacity)
+            }
+            previous.orderOut(nil)
+        }
+        visibilityOverlay = nil
+        visibilityLayers.removeAll()
+        hidingAnimation = false
+        if hideImmediately || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            orderScreenshots(showing)
+            return
+        }
         if showing && stackPanel == nil { layout() }
-        let targets: [NSWindow] = stackPanel.map { [$0] } ?? panels.filter { showing || $0.isVisible }.map { $0 as NSWindow }
+        let targets: [NSWindow] = stackPanel.map { [$0] } ?? panels.filter { showing || interrupted || $0.isVisible }.map { $0 as NSWindow }
         guard !targets.isEmpty else { return }
         let screens = NSScreen.screens
-        guard let firstScreen = screens.first else { return }
-        let screenBounds = screens.dropFirst().reduce(firstScreen.frame) { $0.union($1.frame) }
-        let overlay = NSPanel(contentRect: screenBounds, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        overlay.level = .floating
+        guard let firstScreen = screens.first else { orderScreenshots(showing); return }
+        let menuBarHeight = NSStatusBar.system.thickness
+        let anchor = iconFrame ?? NSRect(x: firstScreen.frame.midX - 10,
+                                        y: firstScreen.frame.maxY - menuBarHeight, width: 20, height: menuBarHeight)
+        let largestWidth = targets.map { $0.frame.width }.max() ?? anchor.width
+        let largestHeight = targets.map { $0.frame.height }.max() ?? anchor.height
+        // A full-size card reaches the icon before shrinking, so leave room
+        // around the anchor even when it lies outside the column of pins.
+        let gatheringArea = anchor.insetBy(dx: -largestWidth / 2, dy: -largestHeight / 2)
+        let initialBounds = startingFrames.values.reduce(gatheringArea) { $0.union($1.frame) }
+        let desktop = screens.dropFirst().reduce(firstScreen.frame) { $0.union($1.frame) }
+        let requestedBounds = targets.reduce(initialBounds) { $0.union($1.frame) }
+            .insetBy(dx: -12, dy: -12).intersection(desktop)
+        guard !requestedBounds.isEmpty else { orderScreenshots(showing); return }
+        let overlay = NSPanel(contentRect: requestedBounds, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        // Draw over the menu bar so it cannot mask the middle of the gather
+        // or the final shrink at the status icon.
+        overlay.level = fullscreenTransition ? .floating : NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+        overlay.setFrame(requestedBounds, display: false)
+        let screenBounds = overlay.frame
         overlay.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         overlay.backgroundColor = .clear
         overlay.isOpaque = false
         overlay.hasShadow = false
         overlay.ignoresMouseEvents = true
+        overlay.sharingType = .readOnly
         let canvas = NSView(frame: NSRect(origin: .zero, size: screenBounds.size))
         canvas.wantsLayer = true
         overlay.contentView = canvas
-        let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let duration: CFTimeInterval = reduced ? 0 : (showing ? 0.46 : 1.7)
-        var layers: [(CALayer, CGRect, CGRect, CGRect)] = []
+        let duration: CFTimeInterval = showing ? 0.46 : ScreenshotTransitions.hideDuration
+        var layers: [(CALayer, [CGRect], Float)] = []
         let gatherCenter = NSPoint(
-            x: (iconFrame?.midX ?? firstScreen.visibleFrame.midX) - screenBounds.minX,
-            y: (iconFrame?.midY ?? firstScreen.visibleFrame.midY) - screenBounds.minY
+            x: anchor.midX - screenBounds.minX,
+            y: anchor.midY - screenBounds.minY
         )
         for window in targets {
-            guard let view = window.contentView,
-                  let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
-            view.cacheDisplay(in: view.bounds, to: bitmap)
-            guard let image = bitmap.cgImage else { continue }
-            let original = window.frame.offsetBy(dx: -screenBounds.minX, dy: -screenBounds.minY)
-            let icon = iconFrame ?? NSRect(x: window.frame.midX, y: window.frame.midY, width: 20, height: 20)
-            let factor = min(icon.width / max(original.width, 1), icon.height / max(original.height, 1))
+            let id = ObjectIdentifier(window)
+            let start = startingFrames[id]
+            guard let view = window.contentView else { continue }
+            let image: CGImage
+            let cardFrame: NSRect
+            let usesThumbnail: Bool
+            if fullscreenTransition, let shot = view as? ShotView,
+               let thumbnail = shot.stackImage?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                // The pin already has a decoded thumbnail. Avoid drawing a live AppKit
+                // window into a bitmap while the system compositor changes Spaces.
+                image = thumbnail
+                cardFrame = shot.transitionCardFrame
+                usesThumbnail = true
+            } else {
+                guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+                view.cacheDisplay(in: view.bounds, to: bitmap)
+                guard let snapshot = bitmap.cgImage else { continue }
+                image = snapshot
+                cardFrame = view.bounds
+                usesThumbnail = false
+            }
+            let original = cardFrame.offsetBy(dx: window.frame.minX - screenBounds.minX,
+                                               dy: window.frame.minY - screenBounds.minY)
+            let factor = min(anchor.width / max(original.width, 1), anchor.height / max(original.height, 1))
             let smallSize = NSSize(width: max(1, original.width * factor), height: max(1, original.height * factor))
-            let center = NSPoint(x: icon.midX - screenBounds.minX, y: icon.midY - screenBounds.minY)
-            let small = CGRect(x: center.x - smallSize.width / 2, y: center.y - smallSize.height / 2, width: smallSize.width, height: smallSize.height)
+            let small = CGRect(x: gatherCenter.x - smallSize.width / 2, y: gatherCenter.y - smallSize.height / 2, width: smallSize.width, height: smallSize.height)
             let gathered = CGRect(x: gatherCenter.x - original.width / 2, y: gatherCenter.y - original.height / 2,
                                   width: original.width, height: original.height)
-            let vanished = CGRect(x: gatherCenter.x - smallSize.width / 2, y: gatherCenter.y - smallSize.height / 2,
-                                  width: smallSize.width, height: smallSize.height)
             let layer = CALayer()
             layer.contents = image
-            layer.contentsGravity = .resize
-            layer.frame = showing ? original : vanished
-            layer.opacity = showing ? 1 : 0
-            canvas.layer?.addSublayer(layer)
-            layers.append((layer, original, gathered, showing ? small : vanished))
-        }
-        hidingAnimation = true
-        targets.forEach { $0.orderOut(nil) }
-        overlay.orderFrontRegardless()
-        CATransaction.begin()
-        CATransaction.setCompletionBlock {
-            overlay.orderOut(nil)
-            if showing {
-                if let stack = self.stackPanel { stack.orderFrontRegardless() }
-                else {
-                    for panel in self.panels { panel.alphaValue = 1; panel.orderFrontRegardless() }
-                    self.layout(animated: true)
-                }
+            layer.contentsGravity = usesThumbnail ? .resizeAspect : .resize
+            if usesThumbnail {
+                layer.cornerRadius = Style.corner
+                layer.masksToBounds = true
             }
-            self.hidingAnimation = false
+            let startFrame = start?.frame.offsetBy(dx: -screenBounds.minX, dy: -screenBounds.minY)
+            let frames = showing ? [startFrame ?? small, original] : [startFrame ?? original, gathered, small]
+            let initialOpacity = start?.opacity ?? (showing ? 0 : 1)
+            layer.frame = frames[0]
+            layer.opacity = initialOpacity
+            canvas.layer?.addSublayer(layer)
+            visibilityLayers[id] = layer
+            layers.append((layer, frames, initialOpacity))
         }
-        for (layer, original, gathered, small) in layers {
+        guard !layers.isEmpty else { orderScreenshots(showing); return }
+        visibilityOverlay = overlay
+        hidingAnimation = true
+        overlay.orderFrontRegardless()
+        targets.forEach { $0.orderOut(nil) }
+        if fullscreenTransition {
+            waitForVisibilityOverlay(overlay) { [weak self] in
+                self?.animateVisibility(in: overlay, layers: layers, showing: showing,
+                                        duration: duration)
+            }
+        } else {
+            animateVisibility(in: overlay, layers: layers, showing: showing,
+                              duration: duration)
+        }
+    }
+
+    // Space transitions can take the window out of the compositor while its
+    // Core Animation clock keeps running. Hold the first frame until the
+    // overlay has been visible on the destination Space across two refreshes.
+    private func waitForVisibilityOverlay(_ overlay: NSPanel, completion: @escaping () -> Void) {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.23
+        let rate = overlay.screen?.maximumFramesPerSecond ?? 60
+        let interval = 1.0 / Double(max(60, rate))
+        func check(_ visibleFrames: Int) {
+            guard self.visibilityOverlay === overlay else { return }
+            let visible = overlay.isOnActiveSpace && overlay.occlusionState.contains(.visible)
+            let frames = visible ? visibleFrames + 1 : 0
+            if frames >= 2 || ProcessInfo.processInfo.systemUptime >= deadline {
+                completion()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + interval) { check(frames) }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval) { check(0) }
+    }
+
+    private func animateVisibility(in overlay: NSPanel, layers: [(CALayer, [CGRect], Float)],
+                                   showing: Bool, duration: CFTimeInterval) {
+        guard visibilityOverlay === overlay else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            self.finishVisibility(in: overlay, showing: showing)
+        }
+        for (layer, frames, initialOpacity) in layers {
+            if let finalFrame = frames.last { layer.frame = finalFrame }
+            layer.opacity = showing ? 1 : 0
             let position = CAKeyframeAnimation(keyPath: "position")
             let size = CAKeyframeAnimation(keyPath: "bounds")
             let opacity = CAKeyframeAnimation(keyPath: "opacity")
-            let frames = showing ? [small, original] : [original, gathered, small]
             position.values = frames.map { NSValue(point: NSPoint(x: $0.midX, y: $0.midY)) }
             size.values = frames.map { NSValue(rect: CGRect(origin: .zero, size: $0.size)) }
-            opacity.values = showing ? [0, 1] : [1, 1, 1, 0]
+            opacity.values = showing ? [initialOpacity, 1] : [initialOpacity, 1, 1, 0]
             if !showing {
-                // Gather first, then shrink visibly; fade only near the end.
                 position.keyTimes = [0, 0.4, 1]
                 size.keyTimes = [0, 0.4, 1]
                 opacity.keyTimes = [0, 0.4, 0.72, 1]
@@ -1869,6 +1995,9 @@ final class PinManager {
                 opacity.timingFunctions = [easing, easing, easing]
             }
             let group = CAAnimationGroup()
+            position.duration = duration
+            size.duration = duration
+            opacity.duration = duration
             group.animations = [position, size, opacity]
             group.duration = duration
             group.timingFunction = CAMediaTimingFunction(name: showing ? .easeInEaseOut : .linear)
@@ -1876,8 +2005,19 @@ final class PinManager {
         }
         CATransaction.commit()
     }
+
+    private func finishVisibility(in overlay: NSPanel, showing: Bool) {
+        guard visibilityOverlay === overlay else { overlay.orderOut(nil); return }
+        visibilityOverlay = nil
+        visibilityLayers.removeAll()
+        if showing && !screenshotsHidden { orderScreenshots(true) }
+        overlay.orderOut(nil)
+        hidingAnimation = false
+    }
+
     var shots: [ShotView] { panels.compactMap { $0.contentView as? ShotView } }
     private var page = 0
+    var latestShot: ShotView? { panels.last?.contentView as? ShotView }
     var topShot: ShotView? { panels.reversed().dropFirst(page).first?.contentView as? ShotView }
     func flip(_ step: Int) {
         guard panels.count > 1 else { return }
@@ -2035,8 +2175,9 @@ final class PinManager {
         let panel = PinPanel(url: url, image: image, screen: screen)
         PendingPins.add(url)
         panels.append(panel)
+        departureLayout?.append(panel)
         page = 0
-        if screenshotsHidden {
+        if screenshotsHidden || hidingAnimation {
             if stackPanel != nil { updateStack() } else { layout() }
             return
         }
@@ -2087,19 +2228,22 @@ final class PinManager {
         view.layer?.cornerRadius = 0
         view.layer?.masksToBounds = true
         overlay.contentView = view
+        ScreenshotTransitions.trackOverlay(overlay)
         overlay.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.3
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
             overlay.animator().setFrame(destination, display: true)
         }, completionHandler: {
-            overlay.orderOut(nil)
+            ScreenshotTransitions.finishOverlay(overlay)
             completion()
         })
     }
 
-    fileprivate func remove(_ panel: PinPanel, sliding direction: PinPlacement? = nil, remember: Bool = true) {
+    fileprivate func remove(_ panel: PinPanel, sliding direction: PinPlacement? = nil, trashing: Bool = false, remember: Bool = true) {
         guard let index = panels.firstIndex(of: panel) else { return }
+        if departureLayout == nil { departureLayout = panels }
+        departureCount += 1
         panels.remove(at: index)
         page = min(page, max(0, panels.count - 1))
         if remember, let shot = panel.contentView as? ShotView, shotFileManager.fileExists(atPath: shot.url.path) { rememberClosed(shot.url, screen: panel.targetDisplayID) }
@@ -2108,22 +2252,33 @@ final class PinManager {
             stackPanel = nil
         } else { updateStack() }
         if let view = panel.contentView as? ShotView { PendingPins.remove(view.url) }
+        let finishDeparture = { [weak self] in
+            guard let self else { return }
+            self.departureCount -= 1
+            guard self.departureCount == 0 else { return }
+            self.departureLayout = nil
+            self.animatePlacement(duration: 0.30)
+        }
+        guard let direction else {
+            if trashing { ScreenshotTransitions.sendToTrash(panel, completion: finishDeparture) }
+            else { ScreenshotTransitions.shrink(panel, completion: finishDeparture) }
+            return
+        }
+        ScreenshotTransitions.trackOverlay(panel)
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : (direction == nil ? 0.12 : 0.22)
-            if let direction {
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                var origin = panel.frame.origin
-                switch direction {
-                case .left: origin.x -= panel.frame.width * 0.75
-                case .right: origin.x += panel.frame.width * 0.75
-                case .top: origin.y += panel.frame.height * 0.75
-                }
-                panel.animator().setFrameOrigin(origin)
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.22
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            var origin = panel.frame.origin
+            switch direction {
+            case .left: origin.x -= panel.frame.width * 0.75
+            case .right: origin.x += panel.frame.width * 0.75
+            case .top: origin.y += panel.frame.height * 0.75
             }
+            panel.animator().setFrameOrigin(origin)
             panel.animator().alphaValue = 0
         }, completionHandler: {
-            panel.orderOut(nil)
-            self.layout(animated: !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+            ScreenshotTransitions.finishOverlay(panel)
+            finishDeparture()
         })
     }
 
@@ -2275,7 +2430,7 @@ final class PinManager {
                 }
                 stack.ignoresMouseEvents = false
             }
-            overlay.orderOut(nil)
+            ScreenshotTransitions.finishOverlay(overlay)
         }
         for (layer, from, to) in animations {
             let position = CABasicAnimation(keyPath: "position")
@@ -2297,6 +2452,7 @@ final class PinManager {
                 layer.add(wiggle, forKey: "collapse-wiggle")
             }
         }
+        ScreenshotTransitions.trackOverlay(overlay)
         overlay.orderFrontRegardless()
         if expanding { stack.orderOut(nil) }
         else { for panel in transitioning { panel.orderOut(nil) } }
@@ -2304,9 +2460,9 @@ final class PinManager {
     }
 
     /// Fill each column from bottom to top, then continue to the left.
-    func animatePlacement() {
+    func animatePlacement(duration: TimeInterval = 0.38) {
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.38
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : duration
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             layout(animated: true)
         }
@@ -2316,7 +2472,9 @@ final class PinManager {
         let availableScreens = NSScreen.screens
         guard !availableScreens.isEmpty else { return }
         let fallbackScreen = NSScreen.main ?? availableScreens[0]
-        for panel in panels where !availableScreens.contains(where: { $0.displayID == panel.targetDisplayID }) {
+        // Reserve a departing card's slot even if a new screenshot arrives during its animation.
+        let layoutPanels = departureLayout ?? panels
+        for panel in layoutPanels where !availableScreens.contains(where: { $0.displayID == panel.targetDisplayID }) {
             panel.targetDisplayID = fallbackScreen.displayID
         }
         for screen in availableScreens {
@@ -2330,7 +2488,7 @@ final class PinManager {
             var yCursor = placement == .top ? top : bottom
             var lineExtent: CGFloat = 0
             var hasItems = false
-            for panel in panels where panel.targetDisplayID == screen.displayID {
+            for panel in layoutPanels where panel.targetDisplayID == screen.displayID {
                 let size = panel.frame.size
                 var x: CGFloat
                 var y: CGFloat
@@ -2358,6 +2516,7 @@ final class PinManager {
                     lineExtent = max(lineExtent, size.width)
                 }
                 hasItems = true
+                guard departureLayout == nil || panels.contains(where: { $0 === panel }) else { continue }
                 let frame = NSRect(x: x, y: y, width: size.width, height: size.height)
                 if animated { panel.animator().setFrame(frame, display: true) }
                 else { panel.setFrame(frame, display: true) }
@@ -2373,7 +2532,6 @@ final class CollapsedStackView: NSView, NSDraggingSource {
     var page = 0
     private var hold: Timer?
     private var holdRing: CAShapeLayer?
-    private var readyToDragImage = false
     private var draggingImage = false
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
     private var startMouse = NSPoint.zero
@@ -2433,7 +2591,6 @@ final class CollapsedStackView: NSView, NSDraggingSource {
     }
     override func mouseDown(with event: NSEvent) {
         guard let window else { return }
-        readyToDragImage = false
         draggingImage = false
         hold?.invalidate()
         holdRing?.removeFromSuperlayer()
@@ -2452,9 +2609,8 @@ final class CollapsedStackView: NSView, NSDraggingSource {
         holdRing = ring
         let timer = Timer(timeInterval: 0.5, repeats: false) { [weak self] _ in
             guard let self, !self.moved else { return }
-            self.readyToDragImage = true
             self.holdRing?.removeFromSuperlayer()
-            NSCursor.openHand.set()
+            self.beginScreenshotDrag(with: event)
         }
         RunLoop.main.add(timer, forMode: .common)
         hold = timer
@@ -2464,21 +2620,27 @@ final class CollapsedStackView: NSView, NSDraggingSource {
         dragOffset = NSPoint(x: startMouse.x - startFrame.minX, y: startMouse.y - startFrame.minY)
         moved = false
     }
+
+    private func beginScreenshotDrag(with event: NSEvent) {
+        guard window?.isVisible == true, NSEvent.pressedMouseButtons & 1 != 0,
+              let shot = PinManager.shared.latestShot, let image = shot.stackImage else { return }
+        draggingImage = true
+        let scale = min(bounds.width / max(1, image.size.width), bounds.height / max(1, image.size.height))
+        let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+        let point = convert(event.locationInWindow, from: nil)
+        let frame = NSRect(x: point.x - size.width / 2, y: point.y - size.height / 2,
+                           width: size.width, height: size.height)
+        let item = NSDraggingItem(pasteboardWriter: shot.url as NSURL)
+        item.setDraggingFrame(frame, contents: image)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
     override func mouseDragged(with event: NSEvent) {
-        guard let window else { return }
+        guard !draggingImage, let window else { return }
         let mouse = window.convertPoint(toScreen: event.locationInWindow)
         guard moved || hypot(mouse.x - startMouse.x, mouse.y - startMouse.y) >= 4 else { return }
         hold?.invalidate()
         holdRing?.removeFromSuperlayer()
-        if readyToDragImage, let shot = PinManager.shared.topShot, let image = shot.stackImage {
-            readyToDragImage = false
-            draggingImage = true
-            let item = NSDraggingItem(pasteboardWriter: shot.url as NSURL)
-            item.setDraggingFrame(bounds, contents: image)
-            beginDraggingSession(with: [item], event: event, source: self)
-            return
-        }
-        guard !draggingImage else { return }
         if !moved { setWiggleSpeed(duration: 0.24) }
         moved = true
         window.setFrameOrigin(NSPoint(x: mouse.x - dragOffset.x, y: mouse.y - dragOffset.y))
@@ -2489,7 +2651,7 @@ final class CollapsedStackView: NSView, NSDraggingSource {
         hold?.invalidate()
         holdRing?.removeFromSuperlayer()
         NSCursor.arrow.set()
-        guard !draggingImage, !readyToDragImage else { return }
+        guard !draggingImage else { return }
         guard moved else {
             // A press that was held must never be interpreted as a click,
             // even if the long-press timer has not fired yet.
@@ -2530,7 +2692,7 @@ final class CollapsedStackView: NSView, NSDraggingSource {
 
 }
 
-private extension NSScreen {
+extension NSScreen {
     var displayID: CGDirectDisplayID {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
     }
@@ -2754,8 +2916,14 @@ private func makeMenuBarIcon() -> NSImage {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private static let fullscreenAutoHideKey = "fullscreenAutoHide"
+    static var fullscreenAutoHideEnabled: Bool { UserDefaults.standard.bool(forKey: fullscreenAutoHideKey) }
+    private lazy var fullscreenMonitor = FullscreenMonitor { [weak self] hidden in
+        PinManager.shared.setFullscreenHidden(hidden, iconFrame: self?.statusIconFrame())
+    }
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
+    private var lastStatusIconFrame: NSRect?
     private func installStatusMenu() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = makeMenuBarIcon()
@@ -2768,6 +2936,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusMenu = menu
         statusItem = item
+        DispatchQueue.main.async { [weak self] in _ = self?.statusIconFrame() }
     }
 
     @objc private func statusClicked(_ sender: NSStatusBarButton) {
@@ -2776,6 +2945,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             startSystemScreenshot()
             return
         }
+        _ = statusIconFrame()
         if let menu = statusMenu { statusItem?.popUpMenu(menu) }
     }
 
@@ -2801,7 +2971,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let stack = menu.addItem(withTitle: pins.collapsed ? "展开全部截图" : "收起全部截图",
                                  action: pins.count > 0 ? #selector(statusStack) : nil, keyEquivalent: "")
         stack.target = self
-        let hidden = menu.addItem(withTitle: pins.screenshotsHidden ? "显示全部截图" : "隐藏全部截图", action: pins.hidingAnimation ? nil : #selector(statusHidden), keyEquivalent: "")
+        let hidden = menu.addItem(withTitle: pins.manuallyHidden ? "显示全部截图" : "隐藏全部截图", action: pins.hidingAnimation ? nil : #selector(statusHidden), keyEquivalent: "")
         hidden.keyEquivalentModifierMask = []
         hidden.target = self
         menu.addItem(.separator())
@@ -2816,6 +2986,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         placement.submenu = placementMenu
         menu.addItem(placement)
         for (title, enabled, action) in [("自动拷贝", UserDefaults.standard.bool(forKey: "autoCopyNewShot"), #selector(statusCopy)),
+                                         ("全屏自动隐藏", Self.fullscreenAutoHideEnabled, #selector(toggleFullscreenAutoHide)),
                                          ("悬停自动展开", PinManager.autoExpandEnabled, #selector(statusHover)),
                                          ("双击 Command 展开或收起", UserDefaults.standard.bool(forKey: "commandExpandStack"), #selector(toggleCommandExpand))] {
             let item = menu.addItem(withTitle: title, action: action, keyEquivalent: enabled ? "✓" : "")
@@ -2862,15 +3033,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func statusReopen() { PinManager.shared.reopen() }
     @objc private func statusStack() { PinManager.shared.toggleStack() }
     @objc private func statusHidden() {
-        let iconFrame: NSRect?
+        PinManager.shared.toggleHidden(iconFrame: lastStatusIconFrame ?? statusIconFrame())
+    }
+    private func statusIconFrame() -> NSRect? {
+        let screens = NSScreen.screens
         if let button = statusItem?.button, let window = button.window {
-            iconFrame = window.convertToScreen(button.convert(button.bounds, to: nil))
-        } else {
-            iconFrame = nil
+            let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+            if !frame.isEmpty, screens.contains(where: { $0.frame.contains(NSPoint(x: frame.midX, y: frame.midY)) }) {
+                lastStatusIconFrame = frame
+            }
         }
-        PinManager.shared.toggleHidden(iconFrame: iconFrame)
+        if let frame = lastStatusIconFrame,
+           screens.contains(where: { $0.frame.contains(NSPoint(x: frame.midX, y: frame.midY)) }) {
+            return frame
+        }
+        return nil
     }
     @objc private func statusHover() { PinManager.shared.toggleAutoExpand() }
+    @objc fileprivate func toggleFullscreenAutoHide() {
+        let enabled = !Self.fullscreenAutoHideEnabled
+        UserDefaults.standard.set(enabled, forKey: Self.fullscreenAutoHideKey)
+        fullscreenMonitor.setEnabled(enabled)
+    }
+
     @objc private func statusCopy() {
         UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: "autoCopyNewShot"), forKey: "autoCopyNewShot")
     }
@@ -2980,6 +3165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         restorePendingPins()
+        fullscreenMonitor.setEnabled(Self.fullscreenAutoHideEnabled)
         CaptureWorkspace.shared.cleanupStaleWorkspaces()
         watcherRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             CaptureWorkspace.shared.cleanupStaleWorkspaces()

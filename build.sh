@@ -85,8 +85,8 @@ cat > "$STAGED_APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key><string>BetterShot.icns</string>
   <key>CFBundleIdentifier</key><string>com.shotpin.ShotPin</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>1.1.0</string>
+  <key>CFBundleVersion</key><string>1.1.0</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
